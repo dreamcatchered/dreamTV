@@ -1,0 +1,33 @@
+# Android / Gradle
+*.iml
+.gradle/
+/local.properties
+/.idea/
+/.kotlin/
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Secrets and private config
+keystore.properties
+**/keystore.jks
+**/local.properties
+
+# Claude/IDE settings (не для публикации)
+.claude/
+
+# App build outputs (опционально можно исключить)
+# app/build/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
