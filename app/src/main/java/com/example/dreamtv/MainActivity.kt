@@ -397,8 +397,8 @@ object PreferencesManager {
 
 // --- Logging Helper ---
 object AppLogger {
-    private val _logs = mutableStateListOf<String>()
-    val logs: List<String> get() = _logs
+    private val _logs = ArrayDeque<String>(50)
+    val logs: List<String> get() = synchronized(_logs) { _logs.toList() }
     var isVisible by mutableStateOf(false) // Default hidden
 
     fun init(context: Context) {
@@ -407,11 +407,13 @@ object AppLogger {
 
     fun log(message: String) {
         Log.d("DreamTV", message)
-        // Keep only last 50 logs to avoid memory issues
-        if (_logs.size > 50) _logs.removeAt(0)
-        _logs.add(message)
+        if (!isVisible) return // Skip list update if not shown
+        synchronized(_logs) {
+            if (_logs.size >= 50) _logs.removeFirst()
+            _logs.addLast(message)
+        }
     }
-    
+
     fun toggleVisibility() {
         isVisible = !isVisible
     }
@@ -419,6 +421,43 @@ object AppLogger {
 
 object GlobalErrorHandler {
     var lastError: String? = null
+
+    fun saveCrashLog(context: Context, error: String) {
+        try {
+            val file = java.io.File(context.filesDir, "crash_log.txt")
+            val timestamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+            val entry = "[$timestamp]\n$error\n\n---\n\n"
+            // Prepend so newest is on top; keep max 8KB
+            val existing = if (file.exists()) file.readText() else ""
+            val combined = entry + existing
+            file.writeText(if (combined.length > 8192) combined.substring(0, 8192) else combined)
+        } catch (_: Exception) {}
+    }
+
+    fun readCrashLog(context: Context): String {
+        return try {
+            val file = java.io.File(context.filesDir, "crash_log.txt")
+            if (file.exists()) file.readText() else "Журнал пуст"
+        } catch (_: Exception) { "Ошибка чтения журнала" }
+    }
+
+    fun clearCrashLog(context: Context) {
+        try { java.io.File(context.filesDir, "crash_log.txt").delete() } catch (_: Exception) {}
+    }
+}
+
+// In-memory channel cache to avoid reloading on back-press
+object ChannelCache {
+    var url: String = ""
+    var channels: List<Channel> = emptyList()
+}
+
+// Singleton HTTP client — не создаётся заново при каждом запросе
+private val sharedHttpClient: OkHttpClient by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 }
 
 // --- Draggable Logs Overlay ---
@@ -426,16 +465,21 @@ object GlobalErrorHandler {
 fun DraggableLogsOverlay() {
     var offsetX by remember { mutableFloatStateOf(100f) }
     var offsetY by remember { mutableFloatStateOf(100f) }
-    val dragOffset = remember { androidx.compose.runtime.mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
-    
+    val logSnapshot = remember { mutableStateOf(AppLogger.logs) }
+
+    // Refresh logs every second only (not on every recompose)
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            logSnapshot.value = AppLogger.logs
+        }
+    }
+
     Box(
         modifier = Modifier
             .offset { IntOffset(offsetX.toInt(), offsetY.toInt()) }
             .pointerInput(Unit) {
                 detectDragGestures(
-                    onDragStart = { offset ->
-                        dragOffset.value = offset - androidx.compose.ui.geometry.Offset(offsetX, offsetY)
-                    },
                     onDrag = { change, dragAmount ->
                         change.consume()
                         offsetX += dragAmount.x
@@ -449,7 +493,6 @@ fun DraggableLogsOverlay() {
             .padding(8.dp)
     ) {
         Column {
-            // Header для перетаскивания
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -464,9 +507,8 @@ fun DraggableLogsOverlay() {
                 )
             }
             Spacer(modifier = Modifier.height(4.dp))
-            // Logs
             LazyColumn(modifier = Modifier.weight(1f)) {
-                items(AppLogger.logs) { log ->
+                items(logSnapshot.value) { log ->
                     Text(text = log, color = Color.Green, fontSize = 12.sp)
                 }
             }
@@ -474,7 +516,8 @@ fun DraggableLogsOverlay() {
     }
 }
 
-data class Channel(val name: String, val url: String, val logo: String? = null, val userAgent: String? = null)
+@androidx.compose.runtime.Stable
+data class Channel(val name: String, val url: String, val logo: String? = null, val userAgent: String? = null, val originalIndex: Int = 0)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -492,18 +535,19 @@ class MainActivity : ComponentActivity() {
         }
         
         // --- Global Exception Handler ---
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        val appContext = applicationContext
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
             val errorMsg = "FATAL CRASH: ${throwable.message}\n${throwable.stackTraceToString()}"
             Log.e("DreamTV", errorMsg)
             GlobalErrorHandler.lastError = errorMsg
-            
-            // Try to restart activity to show error
+            GlobalErrorHandler.saveCrashLog(appContext, errorMsg)
+
             try {
-                val intent = intent
-                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                val intent = packageManager.getLaunchIntentForPackage(packageName)!!.apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK or android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
                 startActivity(intent)
                 android.os.Process.killProcess(android.os.Process.myPid())
-                System.exit(10)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -529,7 +573,7 @@ class MainActivity : ComponentActivity() {
                     onError = { AppLogger.log("Vosk init error: $it") }
                 )
             }
-        }, 2000)
+        }, 5000) // Delay Vosk init to not compete with app startup
 
         // Start Web Remote Service
         try {
@@ -606,7 +650,7 @@ fun DreamTvApp() {
     LaunchedEffect(digitBuffer) {
         if (digitBuffer.isNotEmpty()) {
             showDigitOverlay = true
-            delay(3000) // Wait 3 seconds
+            delay(1500) // Wait 1.5 seconds
             
             // Try to switch channel
             val channelNum = digitBuffer.toIntOrNull()
@@ -779,59 +823,71 @@ fun DreamTvApp() {
         }
     }
 
-    // Save last channel
+    // Save last channel (debounced — write to prefs only once per channel change)
     LaunchedEffect(currentChannelIndex) {
         if (currentChannelIndex != -1) {
-            PreferencesManager.saveLastChannel(context, currentChannelIndex)
+            withContext(Dispatchers.IO) {
+                PreferencesManager.saveLastChannel(context, currentChannelIndex)
+            }
         }
     }
 
-    // Fetch Playlist
+    // Fetch Playlist — with in-memory cache
     LaunchedEffect(currentPlaylistUrl) {
+        // Serve from cache instantly if same URL
+        if (ChannelCache.url == currentPlaylistUrl && ChannelCache.channels.isNotEmpty()) {
+            channels = ChannelCache.channels
+            isLoading = false
+            AppLogger.log("Loaded ${channels.size} channels from cache")
+            return@LaunchedEffect
+        }
+
         isLoading = true
         errorMessage = null
         channels = emptyList()
         AppLogger.log("Fetching playlist: $currentPlaylistUrl")
         withContext(Dispatchers.IO) {
             try {
-                val client = OkHttpClient.Builder()
-                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                    .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                    .build()
-
                 val request = Request.Builder()
                     .url(currentPlaylistUrl)
                     .build()
-                
+
                 AppLogger.log("Executing network request...")
-                client.newCall(request).execute().use { response ->
+                sharedHttpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         throw IOException("Network Error: ${response.code} ${response.message}")
                     }
-                    
+
                     val body = response.body?.string() ?: ""
                     if (body.isEmpty()) {
-                         throw IOException("Playlist is empty")
+                        throw IOException("Playlist is empty")
                     }
 
                     val parsedChannels = parseM3u(body)
                     AppLogger.log("Parsed ${parsedChannels.size} channels")
-                    
+
                     withContext(Dispatchers.Main) {
                         if (parsedChannels.isEmpty()) {
                             errorMessage = "No channels found in playlist."
                         } else {
                             channels = parsedChannels
+                            ChannelCache.url = currentPlaylistUrl
+                            ChannelCache.channels = parsedChannels
                             isLoading = false
                         }
                     }
                 }
             } catch (e: Exception) {
                 AppLogger.log("Error loading playlist: ${e.message}")
-                e.printStackTrace()
                 withContext(Dispatchers.Main) {
-                    errorMessage = "Error: ${e.message}"
-                    isLoading = false
+                    // If cache exists for this URL — show it even on error
+                    if (ChannelCache.url == currentPlaylistUrl && ChannelCache.channels.isNotEmpty()) {
+                        channels = ChannelCache.channels
+                        isLoading = false
+                    } else {
+                        errorMessage = "Error: ${e.message}"
+                        isLoading = false
+                    }
                 }
             }
         }
@@ -942,7 +998,7 @@ fun SplashScreen(onTimeout: () -> Unit) {
         )
     }
     LaunchedEffect(Unit) {
-        delay(2000)
+        delay(800)
         onTimeout()
     }
 }
@@ -1181,7 +1237,10 @@ fun ChannelGrid(
 
     val filteredChannels = remember(searchQuery, channels) {
         if (searchQuery.isBlank()) channels
-        else channels.filter { it.name.contains(searchQuery, ignoreCase = true) }
+        else {
+            val q = searchQuery.lowercase()
+            channels.filter { it.name.lowercase().contains(q) }
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -1293,9 +1352,8 @@ fun ChannelGrid(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                itemsIndexed(filteredChannels) { index, channel ->
-                    // Find original index for correct channel selection
-                    val originalIndex = channels.indexOf(channel)
+                itemsIndexed(filteredChannels, key = { _, ch -> ch.url }) { _, channel ->
+                    val originalIndex = channel.originalIndex
                     ChannelCard(
                         index = originalIndex,
                         channel = channel,
@@ -1316,18 +1374,29 @@ fun ChannelCard(
     onDigitInput: (Int) -> Boolean
 ) {
     var isFocused by remember { mutableStateOf(false) }
-    val scale by animateFloatAsState(if (isFocused) 1.1f else 1.0f)
-    
+    val context = LocalContext.current
+    // Pre-build ImageRequest outside of recomposition hot path
+    val imageRequest = remember(channel.logo) {
+        if (channel.logo != null) {
+            ImageRequest.Builder(context)
+                .data(channel.logo)
+                .crossfade(false)
+                .size(120, 68) // Limit decode size — saves RAM and CPU on ARM v7
+                .memoryCacheKey(channel.logo)
+                .diskCacheKey(channel.logo)
+                .build()
+        } else null
+    }
+
     Box(
         modifier = Modifier
-            .scale(scale)
             .background(if (isFocused) DreamBlack else Color.White, shape = RoundedCornerShape(8.dp))
             .border(2.dp, if (isFocused) DreamBlack else Color.LightGray, shape = RoundedCornerShape(8.dp))
             .clickable { onClick() }
             .onFocusChanged { isFocused = it.isFocused }
             .focusable()
-            .padding(16.dp)
-            .aspectRatio(16f/9f) // Thumbnail shape
+            .padding(12.dp)
+            .aspectRatio(16f / 9f)
             .onKeyEvent { event ->
                 if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
                     onDigitInput(event.nativeKeyEvent.keyCode)
@@ -1342,30 +1411,26 @@ fun ChannelCard(
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.fillMaxSize()
         ) {
-            if (channel.logo != null) {
+            if (imageRequest != null) {
                 AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(channel.logo)
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = channel.name,
+                    model = imageRequest,
+                    contentDescription = null,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .padding(bottom = 8.dp),
+                        .padding(bottom = 4.dp),
                     contentScale = ContentScale.Fit
                 )
             } else {
-                 Spacer(modifier = Modifier.weight(1f))
+                Spacer(modifier = Modifier.weight(1f))
             }
-            
+
             Text(
                 text = "${index + 1}. ${channel.name}",
                 color = if (isFocused) Color.White else DreamBlack,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
-                maxLines = 2,
-                modifier = Modifier.padding(top = if (channel.logo == null) 0.dp else 4.dp)
+                maxLines = 2
             )
         }
     }
@@ -1472,6 +1537,7 @@ fun NewSettingsScreen(context: Context) {
     var playerType by remember { mutableIntStateOf(PreferencesManager.getPlayerType(context)) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showQRDialog by remember { mutableStateOf(false) }
+    var showCrashLogDialog by remember { mutableStateOf(false) }
     var qrCodeData by remember { mutableStateOf<QRCodeResponse?>(null) }
     val coroutineScope = rememberCoroutineScope()
 
@@ -1513,13 +1579,10 @@ fun NewSettingsScreen(context: Context) {
                         // Fetch QR code async
                         coroutineScope.launch(Dispatchers.IO) {
                             try {
-                                val client = OkHttpClient.Builder()
-                                    .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-                                    .build()
                                 val request = Request.Builder()
                                     .url("http://127.0.0.1:8080/api/qrcode")
                                     .build()
-                                val response = client.newCall(request).execute()
+                                val response = sharedHttpClient.newCall(request).execute()
                                 if (response.isSuccessful) {
                                     val jsonStr = response.body?.string() ?: ""
                                     val data = Json.decodeFromString<QRCodeResponse>(jsonStr)
@@ -1649,15 +1712,18 @@ fun NewSettingsScreen(context: Context) {
 
         item {
             Spacer(modifier = Modifier.height(24.dp))
-            Button(
-                onClick = { showAboutDialog = true },
-                colors = androidx.tv.material3.ButtonDefaults.colors(
-                    containerColor = DreamBlack,
-                    contentColor = Color.White
-                ),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("О приложении")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { showAboutDialog = true },
+                    colors = androidx.tv.material3.ButtonDefaults.colors(containerColor = DreamBlack, contentColor = Color.White),
+                    modifier = Modifier.weight(1f)
+                ) { Text("О приложении") }
+
+                Button(
+                    onClick = { showCrashLogDialog = true },
+                    colors = androidx.tv.material3.ButtonDefaults.colors(containerColor = Color(0xFF7B0000), contentColor = Color.White),
+                    modifier = Modifier.weight(1f)
+                ) { Text("📋 Журнал") }
             }
             Spacer(modifier = Modifier.height(32.dp))
         }
@@ -1813,6 +1879,76 @@ fun NewSettingsScreen(context: Context) {
             }
         }
     }
+
+    // Crash Log Dialog
+    if (showCrashLogDialog) {
+        val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        var logText by remember { mutableStateOf("") }
+        LaunchedEffect(Unit) {
+            logText = withContext(Dispatchers.IO) { GlobalErrorHandler.readCrashLog(context) }
+        }
+        androidx.compose.ui.window.Dialog(onDismissRequest = { showCrashLogDialog = false }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.85f)
+                    .background(Color(0xFF1A1A1A), RoundedCornerShape(16.dp))
+                    .padding(20.dp)
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Text("📋 Журнал ошибок", style = MaterialTheme.typography.headlineSmall, color = Color.White, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .background(Color.Black, RoundedCornerShape(8.dp))
+                            .padding(12.dp)
+                    ) {
+                        androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxSize()) {
+                            item {
+                                SelectionContainer {
+                                    Text(
+                                        text = logText,
+                                        color = if (logText == "Журнал пуст") Color.Gray else Color(0xFFFF6B6B),
+                                        fontSize = 11.sp,
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = {
+                                val clip = android.content.ClipData.newPlainText("DreamTV Log", logText)
+                                clipboardManager.setPrimaryClip(clip)
+                                Toast.makeText(context, "Скопировано!", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = androidx.tv.material3.ButtonDefaults.colors(containerColor = Color(0xFF2979FF), contentColor = Color.White),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("📋 Копировать") }
+
+                        Button(
+                            onClick = {
+                                GlobalErrorHandler.clearCrashLog(context)
+                                logText = "Журнал пуст"
+                            },
+                            colors = androidx.tv.material3.ButtonDefaults.colors(containerColor = Color(0xFF7B0000), contentColor = Color.White),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("🗑 Очистить") }
+
+                        Button(
+                            onClick = { showCrashLogDialog = false },
+                            colors = androidx.tv.material3.ButtonDefaults.colors(containerColor = Color.DarkGray, contentColor = Color.White),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Закрыть") }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fun getAppVersion(context: Context): String {
@@ -1927,13 +2063,17 @@ fun VlcPlayerScreen(
     
     DisposableEffect(Unit) {
         onDispose {
-            try {
-                mediaPlayer.stop()
-                mediaPlayer.release()
-                libVlc.release()
-            } catch (e: Exception) {
-                AppLogger.log("VLC release error: ${e.message}")
-            }
+            val mp = mediaPlayer
+            val vlc = libVlc
+            Thread {
+                try {
+                    mp.stop()
+                    mp.release()
+                    vlc.release()
+                } catch (e: Exception) {
+                    Log.e("DreamTV", "VLC release error: ${e.message}")
+                }
+            }.start()
         }
     }
     
@@ -2265,7 +2405,7 @@ fun IjkPlayerScreen(
         showOverlay = false
     }
 
-    // Prepare MediaSource & Apply Options
+    // Prepare MediaSource (options set once in remember block above)
     LaunchedEffect(channel) {
         if (isReleased.get()) return@LaunchedEffect
         lastInteractionTime = System.currentTimeMillis()
@@ -2275,11 +2415,6 @@ fun IjkPlayerScreen(
 
             val userAgent = channel.userAgent ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "user_agent", userAgent)
-            ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "headers", "User-Agent: $userAgent")
-            ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec", 0L)
-            ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L)
-            ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "overlay-format", IjkMediaPlayer.SDL_FCC_RV32.toLong())
-            ijkMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1L)
 
             ijkMediaPlayer.dataSource = channel.url
             surfaceHolder?.let { ijkMediaPlayer.setDisplay(it) }
@@ -2308,13 +2443,17 @@ fun IjkPlayerScreen(
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             if (isReleased.compareAndSet(false, true)) {
-                try {
-                    ijkMediaPlayer.setDisplay(null)
-                    ijkMediaPlayer.stop()
-                    ijkMediaPlayer.release()
-                } catch (e: Exception) {
-                    AppLogger.log("IjkPlayer release error: ${e.message}")
-                }
+                // Release on background thread — never block the UI thread on player teardown
+                val playerRef = ijkMediaPlayer
+                Thread {
+                    try {
+                        playerRef.setDisplay(null)
+                        playerRef.stop()
+                        playerRef.release()
+                    } catch (e: Exception) {
+                        Log.e("DreamTV", "IjkPlayer release error: ${e.message}")
+                    }
+                }.start()
             }
         }
     }
@@ -2481,6 +2620,8 @@ fun IjkPlayerScreen(
 fun OldVideoPlayerScreen(...) { ... }
 */
 
+private val LOGO_REGEX = "tvg-logo=\"([^\"]*)\"".toRegex()
+
 fun parseM3u(content: String): List<Channel> {
     val channels = mutableListOf<Channel>()
     try {
@@ -2492,16 +2633,12 @@ fun parseM3u(content: String): List<Channel> {
         for (line in lines) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
-            
+
             if (trimmed.startsWith("#EXTINF")) {
-                // #EXTINF:-1 tvg-logo="url" group-title="TV",Channel Name
-                // Extract Logo
-                val logoRegex = "tvg-logo=\"([^\"]*)\"".toRegex()
-                val match = logoRegex.find(trimmed)
+                val match = LOGO_REGEX.find(trimmed)
                 if (match != null) {
                     currentLogo = match.groupValues[1].trim()
                 }
-
                 val commaIndex = trimmed.lastIndexOf(',')
                 if (commaIndex != -1) {
                     currentName = trimmed.substring(commaIndex + 1).trim()
@@ -2510,7 +2647,7 @@ fun parseM3u(content: String): List<Channel> {
                 currentUserAgent = trimmed.removePrefix("#EXTVLCOPT:http-user-agent=").trim()
             } else if (!trimmed.startsWith("#")) {
                 if (currentName != null) {
-                    channels.add(Channel(currentName, trimmed, currentLogo, currentUserAgent))
+                    channels.add(Channel(currentName, trimmed, currentLogo, currentUserAgent, channels.size))
                     currentName = null
                     currentLogo = null
                     currentUserAgent = null

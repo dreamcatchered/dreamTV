@@ -31,3 +31,6 @@ keystore.properties
 
 # Temporary files
 *.tmp
+ai_studio_code.html
+index.html
+manifest.json
